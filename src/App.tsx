@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
-  ArrowLeftOutlined, ArrowRightOutlined, BranchesOutlined, CheckOutlined, CloseOutlined,
+  ArrowRightOutlined, BranchesOutlined, CheckOutlined, CloseOutlined,
   CommentOutlined, DiffOutlined, DeleteOutlined, FileDoneOutlined, FileTextOutlined,
   HistoryOutlined, LockOutlined, MenuFoldOutlined, MessageOutlined, PlusOutlined,
-  RedoOutlined, SaveOutlined, SendOutlined, SwapOutlined, UndoOutlined, UnlockOutlined, UserSwitchOutlined,
+  RedoOutlined, SaveOutlined, SendOutlined, SwapOutlined, SyncOutlined, UndoOutlined, UnlockOutlined,
+  CloudServerOutlined, BugOutlined,
 } from '@ant-design/icons'
-import { Alert, Badge, Button, Card, Checkbox, Divider, Empty, Input, Modal, Radio, Segmented, Select, Space, Tag, Tooltip, message } from 'antd'
-import { submitRemotePatch } from './services/mockApi'
+import { Alert, Badge, Button, Card, Checkbox, Drawer, Empty, Input, Modal, Radio, Segmented, Select, Space, Tag, Timeline, Tooltip, message } from 'antd'
+import { getServerOverview, type ServerOverview } from './services/mockApi'
 import { useReviewStore } from './store/review'
-import type { Comment, CommentType, Paragraph, Role } from './types'
+import type { Comment, CommentType, Role } from './types'
 
 const roleMeta: Record<Role, { label: string; description: string; color: string }> = {
   author: { label: '作者工作区', description: '编辑正文，逐条接受或拒绝修改建议', color: '#2f6f5e' },
@@ -16,14 +17,16 @@ const roleMeta: Record<Role, { label: string; description: string; color: string
   editor: { label: '编辑工作区', description: '合并重复意见、锁定已确认段落并比较版本', color: '#5b4d8e' },
 }
 const roleIcon = (role: Role) => role === 'author' ? <FileDoneOutlined /> : role === 'reviewer' ? <CommentOutlined /> : <BranchesOutlined />
+const roleLabel = (role: Role) => role === 'author' ? '作者' : role === 'reviewer' ? '审稿人' : '编辑'
 const formatDate = (value: number) => new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 
 export default function App() {
   const {
-    role, paragraphs, comments, versions, selectedParagraphId, commentFilter, revisionMode, dirty, conflicts,
+    role, paragraphs, comments, versions, selectedParagraphId, commentFilter, revisionMode, dirty,
+    outbox, pendingMerges, lastSeenRevision, serverRevision, lastSyncAt, syncing, failArmed, syncLog,
     setRole, selectParagraph, setCommentFilter, setRevisionMode, updateParagraph, addComment, replyComment,
-    resolveSuggestion, mergeComment, toggleLock, createVersion, addConflict, resolveConflict, dismissConflict,
-    undo, redo, save, resetDemo,
+    resolveSuggestion, mergeComment, toggleLock, createVersion, simulateRemote, reconcile, resolvePending,
+    toggleFailArmed, undo, redo, save, resetDemo,
   } = useReviewStore()
   const [composerOpen, setComposerOpen] = useState(false)
   const [commentType, setCommentType] = useState<CommentType>('comment')
@@ -35,6 +38,8 @@ export default function App() {
   const [versionA, setVersionA] = useState(versions[1]?.id ?? versions[0]?.id)
   const [versionB, setVersionB] = useState(versions[0]?.id)
   const [versionLabel, setVersionLabel] = useState('')
+  const [syncOpen, setSyncOpen] = useState(false)
+  const [serverView, setServerView] = useState<ServerOverview | null>(null)
 
   const selected = paragraphs.find((paragraph) => paragraph.id === selectedParagraphId) ?? paragraphs[0]
   const sections = useMemo(() => Array.from(new Set(paragraphs.map((paragraph) => paragraph.section))), [paragraphs])
@@ -102,14 +107,24 @@ export default function App() {
     setCommentBody(''); setSuggestion(''); setQuote(''); setComposerOpen(false)
     message.success(commentType === 'suggestion' ? '修改建议已提交' : '段落批注已添加')
   }
-  const handleMockConflict = async () => {
-    if (!selected) return
-    const response = await submitRemotePatch(selected)
-    addConflict({
-      id: `conflict-${Date.now()}`, paragraphId: selected.id, localText: selected.text, remoteText: response.remoteText,
-      localAuthor: roleMeta[role].label, remoteAuthor: response.remoteAuthor, detectedAt: Date.now(),
-    })
-    message.warning('模拟接口返回了同段落的远端修改，请处理冲突')
+  const handleSave = () => {
+    if (save()) message.success('草稿已保存到浏览器')
+    else message.warning('还有挂起冲突未处理，处理完才允许保存')
+  }
+  const handleSimulateRemote = async () => {
+    await simulateRemote()
+    message.info('远端协作者已完成离线改动，点击「重新对账」合并')
+  }
+  const handleReconcile = async () => {
+    await reconcile()
+    const state = useReviewStore.getState()
+    if (state.pendingMerges.length > 0) message.warning(`有 ${state.pendingMerges.length} 处段落两侧都改过且分不清先后，已挂起待处理`)
+    else if (state.syncLog[0]?.tone === 'error') message.error('模拟接口失败：本地已回滚，远端已入库部分保留，可安全重试')
+    else message.success('对账完成，本地与远端已对齐')
+  }
+  const openSyncDrawer = () => {
+    setServerView(getServerOverview())
+    setSyncOpen(true)
   }
   const handleCreateVersion = () => {
     if (versionLabel.trim()) createVersion(versionLabel.trim())
@@ -132,10 +147,12 @@ export default function App() {
           <Segmented block value={role} onChange={(value) => setRole(value as Role)} options={(Object.keys(roleMeta) as Role[]).map((item) => ({ label: <span>{roleIcon(item)} {roleMeta[item].label.replace('工作区', '')}</span>, value: item }))} />
         </div>
         <Space>
-          <Badge dot={dirty}><Button icon={<SaveOutlined />} onClick={() => { save(); message.success('草稿已保存到浏览器') }}>保存</Button></Badge>
+          <Badge dot={dirty}><Tooltip title={pendingMerges.length > 0 ? '还有挂起冲突未处理，处理完才允许保存' : '保存草稿到浏览器'}><Button icon={<SaveOutlined />} disabled={pendingMerges.length > 0} onClick={handleSave}>保存</Button></Tooltip></Badge>
           <Button icon={<UndoOutlined />} disabled={!useReviewStore.getState().past.length} onClick={undo} />
           <Button icon={<RedoOutlined />} disabled={!useReviewStore.getState().future.length} onClick={redo} />
-          <Button danger={conflicts.length > 0} icon={<SwapOutlined />} onClick={() => void handleMockConflict()}>模拟冲突</Button>
+          <Tooltip title="模拟远端协作者离线改稿（改动落在模拟接口那份数据上）"><Button icon={<CloudServerOutlined />} disabled={syncing} onClick={() => void handleSimulateRemote()}>模拟远端改动</Button></Tooltip>
+          <Badge count={pendingMerges.length} size="small"><Tooltip title="拉取远端改动并按规则合并：正文认作者、批注认审稿人、锁定段两边都不能动"><Button type="primary" icon={<SyncOutlined spin={syncing} />} loading={syncing} onClick={() => void handleReconcile()}>重新对账</Button></Tooltip></Badge>
+          <Tooltip title={failArmed ? '已注入：下次提交将在中途失败，用于演示回滚与幂等重试' : '注入一次接口故障'}><Button danger={failArmed} icon={<BugOutlined />} onClick={toggleFailArmed}>{failArmed ? '故障已注入' : '注入故障'}</Button></Tooltip>
         </Space>
       </header>
 
@@ -145,16 +162,25 @@ export default function App() {
         <span className="paper-state"><FileTextOutlined /> 论文正文 v2.4</span>
       </div>
 
-      {conflicts.length > 0 && (
+      {pendingMerges.length > 0 && (
         <div className="conflict-stack">
-          {conflicts.map((conflict) => (
+          <Alert
+            type="warning" showIcon
+            message={`${pendingMerges.length} 处段落两侧都改过且分不清先后，已挂起——处理完才允许保存`}
+            description="对每一条挂起选择保留本地或采用远端；全部处理完后会自动重新对账，把合并结果提交到模拟接口。"
+          />
+          {pendingMerges.map((pending) => (
             <Alert
-              key={conflict.id} type="error" showIcon message={`段落冲突：${conflict.localAuthor} 与 ${conflict.remoteAuthor} 同时修改`}
+              key={pending.id} type="error" showIcon
+              message={`挂起冲突：段落 ${paragraphs.find((item) => item.id === pending.paragraphId)?.number ?? ''} 本地（${roleLabel(pending.localRole)}）与远端（${pending.remoteAuthor}）都改过`}
               description={(
                 <div className="conflict-content">
-                  <div><b>本页版本</b><p>{conflict.localText}</p></div>
-                  <div><b>模拟远端版本</b><p>{conflict.remoteText}</p></div>
-                  <Space><Button size="small" onClick={() => resolveConflict(conflict.id, 'local')}>保留本页</Button><Button size="small" type="primary" onClick={() => resolveConflict(conflict.id, 'remote')}>采用远端</Button><Button size="small" type="text" onClick={() => dismissConflict(conflict.id)}>稍后处理</Button></Space>
+                  <div><b>本地版本 · {pending.localAuthor}</b><p>{pending.localText}</p></div>
+                  <div><b>远端版本 · {pending.remoteAuthor}</b><p>{pending.remoteText}</p></div>
+                  <Space>
+                    <Button size="small" type="primary" onClick={() => resolvePending(pending.id, 'local')}>保留本地</Button>
+                    <Button size="small" onClick={() => resolvePending(pending.id, 'remote')}>采用远端</Button>
+                  </Space>
                 </div>
               )}
             />
@@ -186,6 +212,13 @@ export default function App() {
             <Button block icon={<PlusOutlined />} onClick={handleCreateVersion}>保存当前版本</Button>
             <Button block icon={<DiffOutlined />} onClick={() => setVersionOpen(true)}>比较两个版本</Button>
           </div>
+          <div className="sync-box">
+            <div className="panel-title"><SwapOutlined /> 同步状态</div>
+            <p>未同步改动 <b>{outbox.length}</b> 条</p>
+            <p>本地已对齐 <b>r{lastSeenRevision}</b> · 远端 <b>r{serverRevision}</b></p>
+            <p>上次对账 {lastSyncAt ? formatDate(lastSyncAt) : '从未'}</p>
+            <Button block size="small" icon={<HistoryOutlined />} onClick={openSyncDrawer}>同步日志与远端状态</Button>
+          </div>
         </aside>
 
         <section className="document-panel">
@@ -193,7 +226,7 @@ export default function App() {
             <div><h2>大语言模型辅助下的开源维护协作研究</h2><p>作者：林晓、陈默、王远 · 最近保存 {formatDate(Date.now())}</p></div>
             <Space>
               <Checkbox checked={revisionMode} onChange={(event) => setRevisionMode(event.target.checked)}>修订模式</Checkbox>
-              <Tag color={dirty ? 'gold' : 'green'}>{dirty ? '有未保存修改' : '已保存'}</Tag>
+              <Tag color={pendingMerges.length > 0 ? 'red' : dirty ? 'gold' : 'green'}>{pendingMerges.length > 0 ? '有挂起冲突' : dirty ? '有未保存修改' : '已保存'}</Tag>
             </Space>
           </div>
 
@@ -221,14 +254,14 @@ export default function App() {
                         <div><small>当前修订</small><p>{paragraph.text}</p></div>
                       </div>
                     ) : role === 'author' ? (
-                      <Input.TextArea autoSize={{ minRows: 2, maxRows: 8 }} value={paragraph.text} readOnly={paragraph.status === 'locked'} onChange={(event) => updateParagraph(paragraph.id, event.target.value)} />
+                      <Input.TextArea autoSize={{ minRows: 2, maxRows: 8 }} value={paragraph.text} readOnly={paragraph.status === 'locked' || syncing} onChange={(event) => updateParagraph(paragraph.id, event.target.value)} />
                     ) : (
                       <p className="paragraph-text">{paragraph.text}</p>
                     )}
                     <div className="paragraph-actions">
                       {role === 'reviewer' && <><Button size="small" icon={<CommentOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('comment') }}>添加批注</Button><Button size="small" icon={<FileDoneOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('suggestion') }}>提出建议</Button></>}
                       {role === 'editor' && <Button size="small" icon={paragraph.status === 'locked' ? <UnlockOutlined /> : <LockOutlined />} onClick={(event) => { event.stopPropagation(); toggleLock(paragraph.id) }}>{paragraph.status === 'locked' ? '解除锁定' : '锁定段落'}</Button>}
-                      {role === 'author' && <span className="author-tip">可直接修改正文，右侧逐条处理建议</span>}
+                      {role === 'author' && <span className="author-tip">{paragraph.status === 'locked' ? '编辑已锁定该段，两侧都不能改' : '可直接修改正文，右侧逐条处理建议'}</span>}
                     </div>
                   </article>
                 ))}
@@ -303,9 +336,36 @@ export default function App() {
         </div>
       </Modal>
 
+      <Drawer title="同步日志与远端状态" open={syncOpen} onClose={() => setSyncOpen(false)} width={460} afterOpenChange={(open) => { if (open) setServerView(getServerOverview()) }}>
+        <div className="server-overview">
+          <div className="panel-title"><CloudServerOutlined /> 模拟接口（远端）</div>
+          <p>修订号 <b>r{serverView?.revision ?? 0}</b> · 流水 <b>{serverView?.journalSize ?? 0}</b> 条 · 段落 {serverView?.paragraphs.length ?? 0} · 批注 {serverView?.comments.length ?? 0} · 版本 {serverView?.versions.length ?? 0}</p>
+          {serverView && serverView.journal.length > 0 && (
+            <div className="journal-list">
+              {serverView.journal.slice(0, 8).map((entry) => (
+                <div key={`${entry.id}-${entry.rev}`} className="journal-row">
+                  <Tag color={entry.origin === 'remote' ? 'orange' : 'green'}>{entry.origin === 'remote' ? '远端' : '本地'}</Tag>
+                  <span>r{entry.rev}</span>
+                  <span>{entry.authorName}</span>
+                  <span>{entry.kind}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="panel-title"><HistoryOutlined /> 同步日志</div>
+        <Timeline
+          items={syncLog.map((entry) => ({
+            color: entry.tone === 'success' ? 'green' : entry.tone === 'warning' ? 'orange' : entry.tone === 'error' ? 'red' : 'blue',
+            children: <span><small>{formatDate(entry.ts)}</small> {entry.text}</span>,
+          }))}
+        />
+        {!syncLog.length && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有同步记录" />}
+      </Drawer>
+
       <footer className="app-footer">
-        <span>本地草稿自动持久化 · 模拟接口用于演示多人修改后的冲突处理</span>
-        <Button type="text" size="small" icon={<DeleteOutlined />} onClick={() => { resetDemo(); message.success('已重置示例数据') }}>重置示例</Button>
+        <span>本地草稿自动持久化 · 重新对账：正文认作者、批注认审稿人、编辑锁定的段落两边都不能动 · 接口失败只回滚本地，重试不重复入库</span>
+        <Button type="text" size="small" icon={<DeleteOutlined />} onClick={() => { resetDemo(); message.success('已重置示例数据（含模拟接口）') }}>重置示例</Button>
       </footer>
     </div>
   )

@@ -43,18 +43,58 @@ export interface Version {
   paragraphs: Paragraph[]
 }
 
-export interface EditConflict {
+/** 同一段落两侧都改过且分不清先后时挂起的冲突，处理完才允许保存 */
+export interface PendingMerge {
   id: string
   paragraphId: string
   localText: string
   remoteText: string
+  localRole: Role
+  remoteRole: Role
   localAuthor: string
   remoteAuthor: string
   detectedAt: number
 }
 
-export interface HistorySnapshot {
+export type SyncOpKind =
+  | 'setParagraphText'
+  | 'addComment'
+  | 'replyComment'
+  | 'setCommentStatus'
+  | 'setParagraphStatus'
+  | 'addVersion'
+
+/** 一次带角色归属的改动。opId 在重试间保持稳定，模拟接口按它去重，保证重试不重复入库 */
+export interface SyncOp {
+  id: string
+  role: Role
+  authorName: string
+  kind: SyncOpKind
+  paragraphId?: string
+  commentId?: string
+  text?: string
+  commentStatus?: CommentStatus
+  mergedInto?: string
+  paragraphStatus?: ParagraphStatus
+  comment?: Comment
+  reply?: Reply
+  version?: Version
+  ts: number
+}
+
+export interface SyncLogEntry {
+  id: string
+  ts: number
+  tone: 'info' | 'success' | 'warning' | 'error'
+  text: string
+}
+
+export interface DocumentSnapshot {
   paragraphs: Paragraph[]
   comments: Comment[]
   versions: Version[]
+}
+
+export interface HistorySnapshot extends DocumentSnapshot {
+  outbox: SyncOp[]
 }
