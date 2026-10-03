@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
-  ArrowLeftOutlined, ArrowRightOutlined, BranchesOutlined, CheckOutlined, CloseOutlined,
+  ArrowRightOutlined, BranchesOutlined, CheckOutlined, CloseOutlined,
   CommentOutlined, DiffOutlined, DeleteOutlined, FileDoneOutlined, FileTextOutlined,
   HistoryOutlined, LockOutlined, MenuFoldOutlined, MessageOutlined, PlusOutlined,
-  RedoOutlined, SaveOutlined, SendOutlined, SwapOutlined, UndoOutlined, UnlockOutlined, UserSwitchOutlined,
+  RedoOutlined, SaveOutlined, SendOutlined, SyncOutlined, TeamOutlined,
+  ThunderboltOutlined, UndoOutlined, UnlockOutlined,
 } from '@ant-design/icons'
 import { Alert, Badge, Button, Card, Checkbox, Divider, Empty, Input, Modal, Radio, Segmented, Select, Space, Tag, Tooltip, message } from 'antd'
-import { submitRemotePatch } from './services/mockApi'
+import { armNextPushFailure, simulateRemoteEdits } from './services/mockApi'
 import { useReviewStore } from './store/review'
-import type { Comment, CommentType, Paragraph, Role } from './types'
+import type { CommentType, Role } from './types'
 
 const roleMeta: Record<Role, { label: string; description: string; color: string }> = {
   author: { label: '作者工作区', description: '编辑正文，逐条接受或拒绝修改建议', color: '#2f6f5e' },
@@ -21,8 +22,9 @@ const formatDate = (value: number) => new Date(value).toLocaleString('zh-CN', { 
 export default function App() {
   const {
     role, paragraphs, comments, versions, selectedParagraphId, commentFilter, revisionMode, dirty, conflicts,
+    syncing, syncReport, lastSyncedAt,
     setRole, selectParagraph, setCommentFilter, setRevisionMode, updateParagraph, addComment, replyComment,
-    resolveSuggestion, mergeComment, toggleLock, createVersion, addConflict, resolveConflict, dismissConflict,
+    resolveSuggestion, mergeComment, toggleLock, createVersion, syncNow, dismissSyncReport, resolveConflict,
     undo, redo, save, resetDemo,
   } = useReviewStore()
   const [composerOpen, setComposerOpen] = useState(false)
@@ -35,6 +37,7 @@ export default function App() {
   const [versionA, setVersionA] = useState(versions[1]?.id ?? versions[0]?.id)
   const [versionB, setVersionB] = useState(versions[0]?.id)
   const [versionLabel, setVersionLabel] = useState('')
+  const [remoteBusy, setRemoteBusy] = useState(false)
 
   const selected = paragraphs.find((paragraph) => paragraph.id === selectedParagraphId) ?? paragraphs[0]
   const sections = useMemo(() => Array.from(new Set(paragraphs.map((paragraph) => paragraph.section))), [paragraphs])
@@ -90,6 +93,7 @@ export default function App() {
     document.getElementById(`paragraph-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
   const openComposer = (type: CommentType) => {
+    if (selected?.status === 'locked') { message.warning('该段落已被编辑锁定，两侧都不能修改'); return }
     const selectedText = window.getSelection()?.toString().trim()
     setQuote(selectedText && selected?.text.includes(selectedText) ? selectedText : selected?.text.slice(0, 64) ?? '')
     setSuggestion(type === 'suggestion' ? selected?.text ?? '' : '')
@@ -102,14 +106,44 @@ export default function App() {
     setCommentBody(''); setSuggestion(''); setQuote(''); setComposerOpen(false)
     message.success(commentType === 'suggestion' ? '修改建议已提交' : '段落批注已添加')
   }
-  const handleMockConflict = async () => {
-    if (!selected) return
-    const response = await submitRemotePatch(selected)
-    addConflict({
-      id: `conflict-${Date.now()}`, paragraphId: selected.id, localText: selected.text, remoteText: response.remoteText,
-      localAuthor: roleMeta[role].label, remoteAuthor: response.remoteAuthor, detectedAt: Date.now(),
-    })
-    message.warning('模拟接口返回了同段落的远端修改，请处理冲突')
+  const handleSave = () => {
+    if (!save()) { message.error('存在挂起的段落冲突，处理完才允许保存'); return }
+    message.success('草稿已保存到浏览器')
+  }
+  const handleRemoteEdits = async () => {
+    setRemoteBusy(true)
+    try {
+      const lines = await simulateRemoteEdits()
+      if (lines.length === 0) { message.info('远端没有新的改动'); return }
+      Modal.info({
+        title: '远端协作者的离线改动已入库（本地尚未合并）',
+        content: (
+          <div>
+            <ul className="sync-lines">{lines.map((line) => <li key={line}>{line}</li>)}</ul>
+            <Divider style={{ margin: '10px 0' }} />
+            <small>本地草稿与模拟服务端现在各持一份改动，点击「同步对账」重新合并。</small>
+          </div>
+        ),
+      })
+    } finally {
+      setRemoteBusy(false)
+    }
+  }
+  const handleSync = async () => {
+    await syncNow()
+    const state = useReviewStore.getState()
+    if (state.syncReport?.ok && state.conflicts.length > 0) {
+      message.warning('有段落冲突被挂起，处理完才允许保存')
+    }
+  }
+  const handleArmFailure = () => {
+    armNextPushFailure()
+    message.warning('已注入一次性故障：下一次同步将在推送中途失败，用于验证回滚与重试')
+  }
+  const handleResolveConflict = async (conflictId: string, strategy: 'local' | 'remote') => {
+    const ok = await resolveConflict(conflictId, strategy)
+    if (ok) message.success('冲突裁决已入库，该段落基线已推进')
+    else message.error('裁决推送失败：已回滚本地改动，冲突保持挂起，远端状态不变，请重试')
   }
   const handleCreateVersion = () => {
     if (versionLabel.trim()) createVersion(versionLabel.trim())
@@ -132,29 +166,57 @@ export default function App() {
           <Segmented block value={role} onChange={(value) => setRole(value as Role)} options={(Object.keys(roleMeta) as Role[]).map((item) => ({ label: <span>{roleIcon(item)} {roleMeta[item].label.replace('工作区', '')}</span>, value: item }))} />
         </div>
         <Space>
-          <Badge dot={dirty}><Button icon={<SaveOutlined />} onClick={() => { save(); message.success('草稿已保存到浏览器') }}>保存</Button></Badge>
+          <Tooltip title={conflicts.length > 0 ? '有挂起的段落冲突，处理完才允许保存' : ''}>
+            <Badge dot={dirty}><Button icon={<SaveOutlined />} disabled={conflicts.length > 0} onClick={handleSave}>保存</Button></Badge>
+          </Tooltip>
           <Button icon={<UndoOutlined />} disabled={!useReviewStore.getState().past.length} onClick={undo} />
           <Button icon={<RedoOutlined />} disabled={!useReviewStore.getState().future.length} onClick={redo} />
-          <Button danger={conflicts.length > 0} icon={<SwapOutlined />} onClick={() => void handleMockConflict()}>模拟冲突</Button>
+          <Tooltip title="模拟作者/审稿人/编辑在远端的离线改动先入服务端">
+            <Button icon={<TeamOutlined />} loading={remoteBusy} onClick={() => void handleRemoteEdits()}>远端改动</Button>
+          </Tooltip>
+          <Tooltip title="拉取远端改动并与本地合并：正文认作者、批注认审稿人、锁定段落两侧冻结">
+            <Button type="primary" icon={<SyncOutlined />} loading={syncing} onClick={() => void handleSync()}>同步对账</Button>
+          </Tooltip>
+          <Tooltip title="下一次同步的推送阶段将中途失败">
+            <Button icon={<ThunderboltOutlined />} onClick={handleArmFailure}>注入故障</Button>
+          </Tooltip>
         </Space>
       </header>
 
       <div className="role-banner" style={{ '--role-color': roleMeta[role].color } as React.CSSProperties}>
         <span className="role-badge">{roleIcon(role)} {roleMeta[role].label}</span>
         <span>{roleMeta[role].description}</span>
-        <span className="paper-state"><FileTextOutlined /> 论文正文 v2.4</span>
+        <span className="paper-state"><FileTextOutlined /> 论文正文 v2.4{lastSyncedAt ? ` · 上次对账 ${formatDate(lastSyncedAt)}` : ' · 尚未对账'}</span>
       </div>
+
+      {syncReport && (
+        <div className="sync-report">
+          <Alert
+            type={syncReport.ok ? (conflicts.length > 0 ? 'warning' : 'success') : 'error'}
+            showIcon
+            closable
+            onClose={dismissSyncReport}
+            message={syncReport.ok ? `对账完成 · ${formatDate(syncReport.at)}` : '对账失败，已回滚发起方'}
+            description={<ul className="sync-lines">{syncReport.lines.map((line) => <li key={line}>{line}</li>)}</ul>}
+          />
+        </div>
+      )}
 
       {conflicts.length > 0 && (
         <div className="conflict-stack">
           {conflicts.map((conflict) => (
             <Alert
-              key={conflict.id} type="error" showIcon message={`段落冲突：${conflict.localAuthor} 与 ${conflict.remoteAuthor} 同时修改`}
+              key={conflict.id} type="error" showIcon
+              message={`挂起冲突：${conflict.reason}（处理完才允许保存）`}
               description={(
                 <div className="conflict-content">
-                  <div><b>本页版本</b><p>{conflict.localText}</p></div>
-                  <div><b>模拟远端版本</b><p>{conflict.remoteText}</p></div>
-                  <Space><Button size="small" onClick={() => resolveConflict(conflict.id, 'local')}>保留本页</Button><Button size="small" type="primary" onClick={() => resolveConflict(conflict.id, 'remote')}>采用远端</Button><Button size="small" type="text" onClick={() => dismissConflict(conflict.id)}>稍后处理</Button></Space>
+                  <div><b>本地版本 · {conflict.localAuthor}</b><p>{conflict.localText}</p></div>
+                  <div><b>远端版本 · {conflict.remoteAuthor}</b><p>{conflict.remoteText}</p></div>
+                  <Space>
+                    <Button size="small" onClick={() => void handleResolveConflict(conflict.id, 'local')}>保留本地</Button>
+                    <Button size="small" type="primary" onClick={() => void handleResolveConflict(conflict.id, 'remote')}>采用远端</Button>
+                    <small className="conflict-hint">裁决会立即推送到服务端；失败只回滚本地，冲突保持挂起</small>
+                  </Space>
                 </div>
               )}
             />
@@ -190,7 +252,7 @@ export default function App() {
 
         <section className="document-panel">
           <div className="document-toolbar">
-            <div><h2>大语言模型辅助下的开源维护协作研究</h2><p>作者：林晓、陈默、王远 · 最近保存 {formatDate(Date.now())}</p></div>
+            <div><h2>大语言模型辅助下的开源维护协作研究</h2><p>作者：林晓、陈默、王远 · 本地草稿与模拟服务端各持一份改动</p></div>
             <Space>
               <Checkbox checked={revisionMode} onChange={(event) => setRevisionMode(event.target.checked)}>修订模式</Checkbox>
               <Tag color={dirty ? 'gold' : 'green'}>{dirty ? '有未保存修改' : '已保存'}</Tag>
@@ -211,7 +273,7 @@ export default function App() {
                     <div className="paragraph-meta">
                       <span className="paragraph-no">{paragraph.number}</span>
                       <span>段落 {paragraph.number.replace('.', '')}</span>
-                      {paragraph.status === 'locked' && <Tag icon={<LockOutlined />} color="purple">已锁定</Tag>}
+                      {paragraph.status === 'locked' && <Tag icon={<LockOutlined />} color="purple">已锁定 · 两侧不可改</Tag>}
                       {paragraph.status === 'accepted' && <Tag icon={<CheckOutlined />} color="green">已确认</Tag>}
                       {!!paragraphCommentCounts[paragraph.id] && <Tag icon={<MessageOutlined />}>{paragraphCommentCounts[paragraph.id]} 条意见</Tag>}
                     </div>
@@ -226,9 +288,10 @@ export default function App() {
                       <p className="paragraph-text">{paragraph.text}</p>
                     )}
                     <div className="paragraph-actions">
-                      {role === 'reviewer' && <><Button size="small" icon={<CommentOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('comment') }}>添加批注</Button><Button size="small" icon={<FileDoneOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('suggestion') }}>提出建议</Button></>}
+                      {role === 'reviewer' && paragraph.status !== 'locked' && <><Button size="small" icon={<CommentOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('comment') }}>添加批注</Button><Button size="small" icon={<FileDoneOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('suggestion') }}>提出建议</Button></>}
                       {role === 'editor' && <Button size="small" icon={paragraph.status === 'locked' ? <UnlockOutlined /> : <LockOutlined />} onClick={(event) => { event.stopPropagation(); toggleLock(paragraph.id) }}>{paragraph.status === 'locked' ? '解除锁定' : '锁定段落'}</Button>}
-                      {role === 'author' && <span className="author-tip">可直接修改正文，右侧逐条处理建议</span>}
+                      {role === 'author' && paragraph.status !== 'locked' && <span className="author-tip">可直接修改正文，右侧逐条处理建议</span>}
+                      {paragraph.status === 'locked' && role !== 'editor' && <span className="author-tip">编辑已锁定该段落，两侧都不能修改</span>}
                     </div>
                   </article>
                 ))}
@@ -249,6 +312,7 @@ export default function App() {
           <div className="comment-list">
             {visibleComments.map((comment) => {
               const paragraph = paragraphs.find((item) => item.id === comment.paragraphId)
+              const paragraphLocked = paragraph?.status === 'locked'
               return (
                 <Card key={comment.id} size="small" className={`comment-card ${comment.status}`} title={<span>{comment.author} <Tag>{comment.type === 'suggestion' ? '修改建议' : '段落批注'}</Tag></span>} extra={<small>{formatDate(comment.createdAt)}</small>}>
                   <button className="quote-line" onClick={() => paragraph && scrollToParagraph(paragraph.id)}>“{comment.quote}” · 段落 {paragraph?.number}</button>
@@ -258,11 +322,14 @@ export default function App() {
                   <div className="replies">
                     {comment.replies.map((reply) => <div key={reply.id} className="reply"><b>{reply.author}</b><span>{reply.body}</span></div>)}
                   </div>
-                  <div className="reply-box">
-                    <Input size="small" value={replyDrafts[comment.id] ?? ''} onChange={(event) => setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: event.target.value }))} placeholder="回复讨论…" onPressEnter={() => { const body = replyDrafts[comment.id]?.trim(); if (body) { replyComment(comment.id, body); setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: '' })) } }} />
-                    <Button size="small" type="text" icon={<SendOutlined />} onClick={() => { const body = replyDrafts[comment.id]?.trim(); if (body) { replyComment(comment.id, body); setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: '' })) } }} />
-                  </div>
-                  {comment.status === 'open' && role === 'author' && comment.type === 'suggestion' && <div className="decision-row"><Button type="primary" size="small" icon={<CheckOutlined />} onClick={() => resolveSuggestion(comment.id, true)}>接受修改</Button><Button danger size="small" icon={<CloseOutlined />} onClick={() => resolveSuggestion(comment.id, false)}>拒绝</Button></div>}
+                  {!paragraphLocked && (
+                    <div className="reply-box">
+                      <Input size="small" value={replyDrafts[comment.id] ?? ''} onChange={(event) => setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: event.target.value }))} placeholder="回复讨论…" onPressEnter={() => { const body = replyDrafts[comment.id]?.trim(); if (body) { replyComment(comment.id, body); setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: '' })) } }} />
+                      <Button size="small" type="text" icon={<SendOutlined />} onClick={() => { const body = replyDrafts[comment.id]?.trim(); if (body) { replyComment(comment.id, body); setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: '' })) } }} />
+                    </div>
+                  )}
+                  {paragraphLocked && <div className="locked-tip"><LockOutlined /> 段落已锁定，讨论与新批注暂停</div>}
+                  {comment.status === 'open' && role === 'author' && comment.type === 'suggestion' && !paragraphLocked && <div className="decision-row"><Button type="primary" size="small" icon={<CheckOutlined />} onClick={() => resolveSuggestion(comment.id, true)}>接受修改</Button><Button danger size="small" icon={<CloseOutlined />} onClick={() => resolveSuggestion(comment.id, false)}>拒绝</Button></div>}
                   {comment.status === 'open' && role === 'editor' && duplicateParagraphIds.has(comment.paragraphId) && (() => {
                     const sibling = comments.find((item) => item.id !== comment.id && item.paragraphId === comment.paragraphId && item.status === 'open')
                     return sibling ? <Button size="small" type="dashed" icon={<BranchesOutlined />} onClick={() => mergeComment(comment.id, sibling.id)}>合并到“{sibling.author}”意见</Button> : null
@@ -304,7 +371,7 @@ export default function App() {
       </Modal>
 
       <footer className="app-footer">
-        <span>本地草稿自动持久化 · 模拟接口用于演示多人修改后的冲突处理</span>
+        <span>本地草稿与模拟服务端各持一份改动 · 对账时正文认作者、批注认审稿人、编辑锁定的段落两侧冻结 · 失败只回滚发起方，重试不重复入库</span>
         <Button type="text" size="small" icon={<DeleteOutlined />} onClick={() => { resetDemo(); message.success('已重置示例数据') }}>重置示例</Button>
       </footer>
     </div>

@@ -23,6 +23,8 @@ export interface Comment {
   status: CommentStatus
   replies: Reply[]
   createdAt: number
+  updatedAt: number
+  updatedBy: Role
   mergedInto?: string
 }
 
@@ -34,6 +36,9 @@ export interface Paragraph {
   original: string
   status: ParagraphStatus
   highlighted: boolean
+  updatedAt: number
+  updatedBy: Role
+  statusUpdatedAt: number
 }
 
 export interface Version {
@@ -50,6 +55,7 @@ export interface EditConflict {
   remoteText: string
   localAuthor: string
   remoteAuthor: string
+  reason: string
   detectedAt: number
 }
 
